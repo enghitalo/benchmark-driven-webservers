@@ -1,107 +1,81 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <string.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <unistd.h>
 
 #define PORT 8080
 #define SERVER "127.0.0.1"
-#define BUFFER_SIZE 1024
 
 // Flag to indicate if program termination is initiated by Ctrl+C
 volatile sig_atomic_t sigint_received = 0;
 
-// Function to handle Ctrl+C signal
-void handle_sigint(int sig)
+void handle_request(int client_socket_fd)
 {
-    sigint_received = 1; // Set flag to indicate Ctrl+C received
-    printf("\nCaught Ctrl+C. Exiting program...\n");
+    char response[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nHello, World!\r\n";
+    send(client_socket_fd, response, sizeof(response), 0);
 }
 
 int main()
 {
-    int server_socket_fd, client_socket_fd, client_address_len;
-    struct sockaddr_in server_address, client_address;
-    char buffer[BUFFER_SIZE];
+    int server_socket_fd, client_socket_fd;
+    struct sockaddr_in server_address, client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
 
-    // Criação do socket
-    server_socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket_fd < 0)
+    // Create socket
+    if ((server_socket_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
     {
         perror("Error creating socket");
         exit(EXIT_FAILURE);
     }
 
-    // Configurando a estrutura do servidor/socket
+    // Set up server address struct
     server_address.sin_family = AF_INET;
     server_address.sin_port = htons(PORT);
-    server_address.sin_addr.s_addr = inet_addr(SERVER);
     // server_address.sin_addr.s_addr = INADDR_ANY;
+    server_address.sin_addr.s_addr = inet_addr(SERVER);
 
-    // Bind do socket ao endereço e porta
-    if (bind(server_socket_fd, (struct sockaddr *)&server_address, sizeof(server_address)) < 0)
+    // Bind the socket to the specified address and port
+    if (bind(server_socket_fd, (struct sockaddr *)&server_address, sizeof(server_address)) == -1)
     {
-        perror("Erro binding socket at address and port");
+        perror("Error binding socket at address and port");
+        close(server_socket_fd);
         exit(EXIT_FAILURE);
     }
 
-    // Listen para conexões
-    //   listen(server_socket_fd, 5);
+    // Listen for incoming connections
     if (listen(server_socket_fd, SOMAXCONN) == -1)
     {
-        perror("Error waiting for connections");
+        perror("Error listening/waiting for connections");
+        close(server_socket_fd);
         exit(EXIT_FAILURE);
     }
 
-    printf("Waiting for conections at %d...\n", PORT);
+    printf("Server listening on port %d...\n", PORT);
 
-    // Aceitação de conexão
-    client_address_len = sizeof(client_address);
-    client_socket_fd = accept(server_socket_fd, (struct sockaddr *)&client_address, &client_address_len);
-    if (client_socket_fd < 0)
-    {
-        perror("Error accepting conection");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("Client connected: %s\n", inet_ntoa(client_address.sin_addr));
-
-    // Register signal handler for SIGINT (Ctrl+C)
-    signal(SIGINT, handle_sigint);
-
+    // Loop to keep connection open
     while (1)
-    { // Loop to keep connection open
-        // Check if Ctrl+C signal was received
-        if (sigint_received == 1)
+    {
+        // Accept a connection
+        if ((client_socket_fd = accept(server_socket_fd, (struct sockaddr *)&client_addr, &client_addr_len)) == -1)
         {
-            break;
+            perror("Error accepting connection");
+            close(server_socket_fd);
+            exit(EXIT_FAILURE);
+            // continue;
         }
 
-        // Receive message from client
-        ssize_t received_bytes = recv(client_socket_fd, buffer, sizeof(buffer), 0);
-        if (received_bytes < 0)
-        {
-            perror("Error receiving message");
-            break;
-        }
-        else if (received_bytes == 0)
-        {
-            printf("Client disconnected. Exiting loop...\n");
-            break;
-        }
+        // printf("Connection accepted from %s\n", inet_ntoa(client_addr.sin_addr));
 
-        buffer[received_bytes] = '\0';
-        // printf("Client message: %s\n", buffer);
+        // Handle the HTTP request
+        handle_request(client_socket_fd);
 
-        // Send response to client
-        const char *message = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nFoo";
-        send(client_socket_fd, message, strlen(message), 0);
+        // Close the client socket
+        close(client_socket_fd);
     }
 
-    // Close sockets only after loop exits (due to error or Ctrl+C)
-    close(client_socket_fd);
+    // Close the server socket
     close(server_socket_fd);
 
     return 0;
