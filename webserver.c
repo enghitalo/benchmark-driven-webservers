@@ -6,7 +6,7 @@
 #include <arpa/inet.h>
 #include <signal.h>
 
-#define PORT 5000
+#define PORT 8080
 #define SERVER "127.0.0.1"
 #define BUFFER_SIZE 1024
 
@@ -49,7 +49,7 @@ int main()
 
     // Listen para conexões
     //   listen(server_socket_fd, 5);
-    if (listen(server_socket_fd, 1) == -1)
+    if (listen(server_socket_fd, SOMAXCONN) == -1)
     {
         perror("Error waiting for connections");
         exit(EXIT_FAILURE);
