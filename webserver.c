@@ -81,9 +81,14 @@ int main()
 
         // Receive message from client
         ssize_t received_bytes = recv(client_socket_fd, buffer, sizeof(buffer), 0);
-        if (received_bytes <= 0)
+        if (received_bytes < 0)
         {
             perror("Error receiving message");
+            break;
+        }
+        else if (received_bytes == 0)
+        {
+            printf("Client disconnected. Exiting loop...\n");
             break;
         }
 
