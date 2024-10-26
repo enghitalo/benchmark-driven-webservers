@@ -1,16 +1,16 @@
-// Load Balancing approach:
+// Circular Queue with Mutex and Atomic Operations
 
 /*
-clear && wrk -t16 -c512 -d10s http://127.0.0.1:8080 
+clear && wrk -t16 -c512 -d30s http://127.0.0.1:8080
 
-Running 10s test @ http://127.0.0.1:8080
+Running 30s test @ http://127.0.0.1:8080
   16 threads and 512 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     3.06ms    1.40ms  32.95ms   73.10%
-    Req/Sec     7.83k   592.49     9.62k    72.38%
-  1254256 requests in 10.08s, 0.00B read
-  Socket errors: connect 0, read 1254256, write 0, timeout 0
-Requests/sec: 124464.81
+    Latency     2.71ms    1.16ms  23.37ms   72.20%
+    Req/Sec     8.72k   609.28    10.68k    70.10%
+  4169586 requests in 30.10s, 0.00B read
+  Socket errors: connect 0, read 4169586, write 0, timeout 0
+Requests/sec: 138528.00
 Transfer/sec:       0.00B
 */
 #include <stdio.h>
@@ -19,6 +19,7 @@ Transfer/sec:       0.00B
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #define PORT 8080
 #define BACKLOG 512
@@ -34,9 +35,10 @@ const char *response = "HTTP/1.1 200 OK\r\n"
 int server_fd;
 pthread_t thread_ids[NUM_WORKERS];
 pthread_mutex_t lock;
-pthread_cond_t condition;
 int client_queue[BACKLOG];
-int queue_front = 0, queue_rear = 0, queue_size = 0;
+int queue_front = 0, queue_rear = 0;
+atomic_int queue_size = 0;  // Use atomic int for queue size
+atomic_int has_clients = 0; // Flag to indicate if there are clients
 
 // Function to enqueue a client connection
 void enqueue_client(int client_fd)
@@ -44,23 +46,36 @@ void enqueue_client(int client_fd)
     pthread_mutex_lock(&lock);
     client_queue[queue_rear] = client_fd;
     queue_rear = (queue_rear + 1) % BACKLOG;
-    queue_size++;
-    pthread_cond_signal(&condition);
+    atomic_fetch_add(&queue_size, 1);
+    atomic_store(&has_clients, 1); // Set flag indicating clients are present
     pthread_mutex_unlock(&lock);
 }
 
 // Function to dequeue a client connection
 int dequeue_client()
 {
-    pthread_mutex_lock(&lock);
-    while (queue_size == 0)
+    int client_fd;
+
+    while (1)
     {
-        pthread_cond_wait(&condition, &lock);
+        pthread_mutex_lock(&lock);
+        if (atomic_load(&queue_size) > 0)
+        {
+            client_fd = client_queue[queue_front];
+            queue_front = (queue_front + 1) % BACKLOG;
+            atomic_fetch_sub(&queue_size, 1);
+            if (atomic_load(&queue_size) == 0)
+            {
+                atomic_store(&has_clients, 0); // Clear flag if no clients
+            }
+            pthread_mutex_unlock(&lock);
+            break;
+        }
+        pthread_mutex_unlock(&lock);
+        // Optionally add a short sleep to reduce busy-waiting
+        usleep(100); // Sleep for 100 microseconds
     }
-    int client_fd = client_queue[queue_front];
-    queue_front = (queue_front + 1) % BACKLOG;
-    queue_size--;
-    pthread_mutex_unlock(&lock);
+
     return client_fd;
 }
 
@@ -96,6 +111,15 @@ int main()
         exit(EXIT_FAILURE);
     }
 
+    // Set socket options
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)) < 0)
+    {
+        perror("setsockopt failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
     // Bind server socket
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
@@ -116,9 +140,8 @@ int main()
         exit(EXIT_FAILURE);
     }
 
-    // Initialize mutex and condition variable
+    // Initialize mutex
     pthread_mutex_init(&lock, NULL);
-    pthread_cond_init(&condition, NULL);
 
     // Create worker threads
     for (int i = 0; i < NUM_WORKERS; i++)
@@ -142,7 +165,6 @@ int main()
 
     // Cleanup
     pthread_mutex_destroy(&lock);
-    pthread_cond_destroy(&condition);
     close(server_fd);
 
     return 0;
