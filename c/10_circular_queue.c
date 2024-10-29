@@ -21,12 +21,12 @@ Transfer/sec:     15.27MB
 #include <stdatomic.h>
 
 #define PORT 8080
-#define INITIAL_THREAD_POOL_SIZE 16
+#define INITIAL_THREAD_POOL_SIZE 8
 #define MAX_THREAD_POOL_SIZE 16
-#define MAX_CONNECTION_SIZE 2048
+#define MAX_CONNECTION_SIZE 512
 #define MAX_WAITING_QUEUE_SIZE 1024
-#define BACKLOG 1024
-#define BUFFER_SIZE 2048
+#define BACKLOG 512
+#define BUFFER_SIZE 140
 #define RESPONSE_BODY "{\"message\": \"Hello, world!\"}"
 #define RESPONSE_BODY_LENGTH (sizeof(RESPONSE_BODY) - 1)
 
@@ -125,6 +125,7 @@ void adjust_thread_pool_size()
 
     if (queue_len > (MAX_WAITING_QUEUE_SIZE / 2) && pool_size < MAX_THREAD_POOL_SIZE)
     {
+        // printf("Increasing thread pool size\n");
         int new_size = pool_size + 2;
         new_size = new_size > MAX_THREAD_POOL_SIZE ? MAX_THREAD_POOL_SIZE : new_size;
         for (int i = pool_size; i < new_size; i++)
@@ -135,6 +136,7 @@ void adjust_thread_pool_size()
     }
     else if (queue_len < (MAX_WAITING_QUEUE_SIZE / 4) && pool_size > INITIAL_THREAD_POOL_SIZE)
     {
+        // printf("Decreasing thread pool size\n");
         int new_size = pool_size - 2;
         new_size = new_size < INITIAL_THREAD_POOL_SIZE ? INITIAL_THREAD_POOL_SIZE : new_size;
         atomic_store(&current_thread_pool_size, new_size);
@@ -157,6 +159,7 @@ int main()
     int addrlen = sizeof(address);
     thread_ids = malloc(MAX_THREAD_POOL_SIZE * sizeof(pthread_t));
     pthread_t monitor_tid;
+    atomic_int stop_flag = 0; // Flag to signal threads to stop
 
     // Create server socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0)
@@ -200,9 +203,9 @@ int main()
     // Create worker threads
     for (int i = 0; i < INITIAL_THREAD_POOL_SIZE; i++)
     {
-        pthread_create(&thread_ids[i], NULL, worker_thread, NULL);
+        pthread_create(&thread_ids[i], NULL, worker_thread, &stop_flag);
     }
-    pthread_create(&monitor_tid, NULL, monitor_thread, NULL);
+    pthread_create(&monitor_tid, NULL, monitor_thread, &stop_flag);
 
     while (1)
     {
@@ -217,6 +220,20 @@ int main()
         // Enqueue the client connection
         enqueue_client(client_fd);
     }
+
+    // Signal threads to stop
+    atomic_store(&stop_flag, 1);
+
+    // Cancel and detach worker threads
+    for (int i = 0; i < atomic_load(&current_thread_pool_size); i++)
+    {
+        pthread_cancel(thread_ids[i]);
+        pthread_detach(thread_ids[i]); // Free the resources of the thread
+    }
+
+    // Cancel and detach monitor thread
+    pthread_cancel(monitor_tid);
+    pthread_detach(monitor_tid); // Free the resources of the thread
 
     // Cleanup
     pthread_mutex_destroy(&lock);
