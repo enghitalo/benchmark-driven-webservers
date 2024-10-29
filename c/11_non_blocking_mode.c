@@ -8,99 +8,71 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <sys/select.h>
+#include <sys/epoll.h>
 
-#define MAX_CLIENTS 512
-#define QUEUE_SIZE 512
 #define PORT 8081
 #define BUFFER_SIZE 140
 #define RESPONSE_BODY "{\"message\": \"Hello, world!\"}"
 #define RESPONSE_BODY_LENGTH (sizeof(RESPONSE_BODY) - 1)
-
-// Client connection queue
-int client_queue[QUEUE_SIZE];
-int front = 0, rear = 0;
-pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
-
-// Function to enqueue a client connection
-void enqueue_client(int client_fd)
-{
-    pthread_mutex_lock(&queue_mutex);
-    while ((rear + 1) % QUEUE_SIZE == front)
-    { // Queue is full
-        pthread_cond_wait(&queue_cond, &queue_mutex);
-    }
-    client_queue[rear] = client_fd;
-    rear = (rear + 1) % QUEUE_SIZE;
-    pthread_cond_signal(&queue_cond);
-    pthread_mutex_unlock(&queue_mutex);
-}
-
-// Function to dequeue a client connection
-int dequeue_client()
-{
-    pthread_mutex_lock(&queue_mutex);
-    while (front == rear)
-    { // Queue is empty
-        pthread_cond_wait(&queue_cond, &queue_mutex);
-    }
-    int client_fd = client_queue[front];
-    front = (front + 1) % QUEUE_SIZE;
-    pthread_cond_signal(&queue_cond);
-    pthread_mutex_unlock(&queue_mutex);
-    return client_fd;
-}
+#define BACKLOG 1024
 
 // Worker thread function
 void *worker_thread(void *arg)
 {
+    int epoll_fd = *(int *)arg;
+    struct epoll_event events[BACKLOG];
+
     while (1)
     {
-        int client_fd = dequeue_client();
-
-        // Handle client connection (non-blocking)
-        char buffer[BUFFER_SIZE] = {0};
-        int bytes_read = recv(client_fd, buffer, sizeof(buffer), 0);
-
-        if (bytes_read > 0)
+        int num_events = epoll_wait(epoll_fd, events, BACKLOG, -1);
+        for (int i = 0; i < num_events; i++)
         {
-            // Process the received data
-            char response[BUFFER_SIZE];
-            int response_length = snprintf(response, sizeof(response),
-                                           "HTTP/1.1 200 OK\r\n"
-                                           "Content-Type: application/json\r\n"
-                                           "Content-Length: %zu\r\n"
-                                           "Connection: close\r\n\r\n"
-                                           "%s",
-                                           RESPONSE_BODY_LENGTH, RESPONSE_BODY);
+            if (events[i].events & (EPOLLHUP | EPOLLERR))
+            {
+                close(events[i].data.fd);
+                continue;
+            }
 
-            send(client_fd, response, response_length, 0);
-            close(client_fd);
+            if (events[i].events & EPOLLIN)
+            {
+                char buffer[BUFFER_SIZE] = {0};
+                int bytes_read = recv(events[i].data.fd, buffer, sizeof(buffer) - 1, 0);
+                if (bytes_read < 0)
+                {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    {
+                        perror("recv error");
+                    }
+                    close(events[i].data.fd);
+                    continue;
+                }
+                else if (bytes_read == 0)
+                {
+                    // Connection closed by the client
+                    close(events[i].data.fd);
+                    continue;
+                }
+
+                // Null-terminate the received data
+                buffer[bytes_read] = '\0';
+                printf("Received bytes_read: %d\n", bytes_read);
+                printf("Received request: %s\n", buffer);
+
+                // Prepare the HTTP response
+                char response[BUFFER_SIZE];
+                int response_length = snprintf(response, sizeof(response),
+                                               "HTTP/1.1 200 OK\r\n"
+                                               "Content-Type: application/json\r\n"
+                                               "Content-Length: %zu\r\n"
+                                               "Connection: close\r\n\r\n"
+                                               "%s",
+                                               RESPONSE_BODY_LENGTH, RESPONSE_BODY);
+                send(events[i].data.fd, response, response_length, 0);
+
+                // Close the client socket after sending the response
+                close(events[i].data.fd);
+            }
         }
-        else if (bytes_read == 0 || (bytes_read < 0 && errno != EAGAIN))
-        {
-            // Connection closed or error
-            close(client_fd);
-        }
-    }
-    return NULL;
-}
-
-// Function to adjust thread pool size
-void adjust_thread_pool_size()
-{
-    // Example: dynamically adjust thread pool based on load
-}
-
-// Monitor thread function
-void *monitor_thread(void *arg)
-{
-    while (1)
-    {
-        // Implement logic to monitor server state and adjust thread pool size
-        adjust_thread_pool_size();
-        sleep(5); // Adjust as necessary
     }
     return NULL;
 }
@@ -130,59 +102,50 @@ int main()
     }
 
     // Listen for incoming connections
-    if (listen(server_fd, MAX_CLIENTS) < 0)
+    if (listen(server_fd, BACKLOG) < 0)
     {
         perror("Listen failed");
         close(server_fd);
         return -1;
     }
 
+    // Create epoll instance
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0)
+    {
+        perror("epoll_create1 failed");
+        close(server_fd);
+        return -1;
+    }
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = server_fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
+
     // Create worker threads
-    int num_threads = 4; // Adjust as needed
+    int num_threads = 16; // Adjust as needed
     pthread_t threads[num_threads];
     for (int i = 0; i < num_threads; i++)
     {
-        pthread_create(&threads[i], NULL, worker_thread, NULL);
+        pthread_create(&threads[i], NULL, worker_thread, &epoll_fd);
     }
 
-    // Create monitor thread
-    pthread_t monitor;
-    pthread_create(&monitor, NULL, monitor_thread, NULL);
-
     // Main loop to accept clients
-    fd_set read_fds;
-    int max_fd = server_fd;
-
     while (1)
     {
-        // Clear the set and add the server socket
-        FD_ZERO(&read_fds);
-        FD_SET(server_fd, &read_fds);
-
-        // Wait for an activity on one of the sockets
-        if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0)
+        int client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd >= 0)
         {
-            perror("select");
-            break;
+            fcntl(client_fd, F_SETFL, O_NONBLOCK); // Set client socket to non-blocking
+            ev.events = EPOLLIN | EPOLLET;         // Edge-triggered
+            ev.data.fd = client_fd;
+            epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
         }
-
-        // Check if there is a new connection on the server socket
-        if (FD_ISSET(server_fd, &read_fds))
+        else if (errno != EWOULDBLOCK)
         {
-            int client_fd = accept(server_fd, NULL, NULL);
-            if (client_fd >= 0)
-            {
-                fcntl(client_fd, F_SETFL, O_NONBLOCK); // Set client socket to non-blocking
-                enqueue_client(client_fd);
-                if (client_fd > max_fd)
-                {
-                    max_fd = client_fd;
-                }
-            }
-            else if (errno != EWOULDBLOCK)
-            {
-                perror("Accept failed");
-            }
+            perror("Accept failed");
+            break;
         }
     }
 
