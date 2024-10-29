@@ -1,3 +1,16 @@
+/*
+wrk -t16 -c512 -d10s http://127.0.0.1:8081
+
+Running 10s test @ http://127.0.0.1:8081
+  16 threads and 512 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     8.58ms   13.28ms 147.27ms   88.40%
+    Req/Sec     1.35k     2.01k    9.69k    85.17%
+  201931 requests in 10.12s, 22.72MB read
+  Socket errors: connect 0, read 1137, write 0, timeout 0
+Requests/sec:  19961.76
+Transfer/sec:      2.25MB
+*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -14,17 +27,22 @@
 #define BUFFER_SIZE 140
 #define RESPONSE_BODY "{\"message\": \"Hello, world!\"}"
 #define RESPONSE_BODY_LENGTH (sizeof(RESPONSE_BODY) - 1)
-#define BACKLOG 1024
+#define MAX_CONNECTION_SIZE 512
+#define INITIAL_THREAD_POOL_SIZE 8
+#define MAX_THREAD_POOL_SIZE 16
 
 // Worker thread function
 void *worker_thread(void *arg)
 {
     int epoll_fd = *(int *)arg;
-    struct epoll_event events[BACKLOG];
+    struct epoll_event events[MAX_CONNECTION_SIZE];
 
     while (1)
     {
-        int num_events = epoll_wait(epoll_fd, events, BACKLOG, -1);
+        int num_events;
+
+        num_events = epoll_wait(epoll_fd, events, MAX_CONNECTION_SIZE, -1);
+
         for (int i = 0; i < num_events; i++)
         {
             if (events[i].events & (EPOLLHUP | EPOLLERR))
@@ -36,41 +54,35 @@ void *worker_thread(void *arg)
             if (events[i].events & EPOLLIN)
             {
                 char buffer[BUFFER_SIZE] = {0};
-                int bytes_read = recv(events[i].data.fd, buffer, sizeof(buffer) - 1, 0);
+                int bytes_read;
+
+                while ((bytes_read = recv(events[i].data.fd, buffer, sizeof(buffer) - 1, 0)) > 0)
+                {
+                    buffer[bytes_read] = '\0';
+
+                    char response[BUFFER_SIZE];
+                    int response_length = snprintf(response, sizeof(response),
+                                                   "HTTP/1.1 200 OK\r\n"
+                                                   "Content-Type: application/json\r\n"
+                                                   "Content-Length: %zu\r\n"
+                                                   "Connection: close\r\n\r\n"
+                                                   "%s",
+                                                   RESPONSE_BODY_LENGTH, RESPONSE_BODY);
+                    send(events[i].data.fd, response, response_length, 0);
+                }
+
                 if (bytes_read < 0)
                 {
                     if (errno != EAGAIN && errno != EWOULDBLOCK)
                     {
-                        perror("recv error");
+                        continue;
                     }
-                    close(events[i].data.fd);
-                    continue;
                 }
                 else if (bytes_read == 0)
                 {
-                    // Connection closed by the client
                     close(events[i].data.fd);
                     continue;
                 }
-
-                // Null-terminate the received data
-                buffer[bytes_read] = '\0';
-                printf("Received bytes_read: %d\n", bytes_read);
-                printf("Received request: %s\n", buffer);
-
-                // Prepare the HTTP response
-                char response[BUFFER_SIZE];
-                int response_length = snprintf(response, sizeof(response),
-                                               "HTTP/1.1 200 OK\r\n"
-                                               "Content-Type: application/json\r\n"
-                                               "Content-Length: %zu\r\n"
-                                               "Connection: close\r\n\r\n"
-                                               "%s",
-                                               RESPONSE_BODY_LENGTH, RESPONSE_BODY);
-                send(events[i].data.fd, response, response_length, 0);
-
-                // Close the client socket after sending the response
-                close(events[i].data.fd);
             }
         }
     }
@@ -101,15 +113,13 @@ int main()
         return -1;
     }
 
-    // Listen for incoming connections
-    if (listen(server_fd, BACKLOG) < 0)
+    if (listen(server_fd, MAX_CONNECTION_SIZE) < 0)
     {
         perror("Listen failed");
         close(server_fd);
         return -1;
     }
 
-    // Create epoll instance
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0)
     {
@@ -123,9 +133,8 @@ int main()
     ev.data.fd = server_fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
 
-    // Create worker threads
-    int num_threads = 16; // Adjust as needed
-    pthread_t threads[num_threads];
+    int num_threads = INITIAL_THREAD_POOL_SIZE;
+    pthread_t threads[MAX_THREAD_POOL_SIZE];
     for (int i = 0; i < num_threads; i++)
     {
         pthread_create(&threads[i], NULL, worker_thread, &epoll_fd);
