@@ -92,7 +92,12 @@ void *worker_thread(void *arg)
         char buffer[BUFFER_SIZE] = {0};
 
         // Read request
-        read(client_fd, buffer, BUFFER_SIZE);
+        if (read(client_fd, buffer, sizeof(buffer) - 1) < 0)
+        {
+            perror("read failed");
+            close(client_fd);
+            continue;
+        }
 
         // Write and send response
         char response[BUFFER_SIZE];
@@ -104,7 +109,10 @@ void *worker_thread(void *arg)
                                        "%s",
                                        RESPONSE_BODY_LENGTH, RESPONSE_BODY);
 
-        write(client_fd, response, response_length);
+        if (write(client_fd, response, response_length) < 0)
+        {
+            perror("write failed");
+        }
         close(client_fd);
     }
     return NULL;
