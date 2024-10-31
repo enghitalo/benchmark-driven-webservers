@@ -1,154 +1,181 @@
 /*
-wrk -t16 -c512 -d10s http://127.0.0.1:8080
+wrk -t16 -c512 -d60s http://127.0.0.1:8080
 
-Running 1m test @ http://127.0.0.1:8080
+Running 30s test @ http://127.0.0.1:8080
   16 threads and 512 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     9.81ms   61.52ms   1.67s    96.62%
-    Req/Sec     5.11k     1.76k   10.80k    67.75%
-  4870666 requests in 1.00m, 0.00B read
-  Socket errors: connect 0, read 4870667, write 0, timeout 173
-Requests/sec:  81046.15
-Transfer/sec:       0.00B
+    Latency     3.20ms    1.30ms  43.98ms   71.73%
+    Req/Sec     7.52k   566.85     9.81k    73.09%
+  3597961 requests in 30.10s, 411.75MB read
+Requests/sec: 119535.90
+Transfer/sec:     13.68MB
 */
-import net
 import sync
 import time
 
+#include <arpa/inet.h>
+
+pub enum SocketType {
+	udp       = C.SOCK_DGRAM
+	tcp       = C.SOCK_STREAM
+	seqpacket = C.SOCK_SEQPACKET
+}
+
+// AddrFamily are the available address families
+pub enum AddrFamily {
+	unix   = C.AF_UNIX
+	ip     = C.AF_INET
+	ip6    = C.AF_INET6
+	unspec = C.AF_UNSPEC
+}
+
+fn C.socket(domain AddrFamily, typ SocketType, protocol int) int
+
+fn C.htons(host u16) u16
+
+fn C.bind(sockfd int, address &C.sockaddr_in, addrlen u32) int
+
+fn C.listen(sockfd int, backlog int) int
+
+fn C.accept(sockfd int, address &C.sockaddr_in, addrlen &u32) int
+
+fn C.setsockopt(sockfd int, level int, optname int, optval &int, optlen u32) int
+
+fn C.recv(sockfd int, buffer &u8, len u32, flags int) int
+
+fn C.send(sockfd int, buffer &u8, len u32, flags int) int
+
+pub struct C.sockaddr_in {
+mut:
+	sin_family AddrFamily
+	sin_port   u16
+	sin_addr   int
+}
+
 const port = 8080
+const max_waiting_queue_size = 512
 const backlog = 512
-const num_workers = 16
-const response = 'HTTP/1.1 200 OK\r\n' + 'Date: Wed, 23 Oct 2024 12:00:00 GMT\r\n' +
-	'Content-Type: application/json\r\n' + 'Content-Length: 27\r\n' +
-	'Connection: keep-alive\r\n\r\n' + '{\r\n  "message": "Hello, world!"\r\n}'
-
-// @[heap]
-// pub struct TcpConn {
-// pub mut:
-// 	sock           TcpSocket
-// 	handle         int
-// 	write_deadline time.Time
-// 	read_deadline  time.Time
-// 	read_timeout   time.Duration
-// 	write_timeout  time.Duration
-// 	is_blocking    bool = true
-// }
-
-// struct TcpSocket {
-// 	Socket
-// }
-
-// pub struct Socket {
-// pub:
-// 	handle int
-// }
-
-struct Node {
-	client net.TcpConn
-mut:
-	next &Node = unsafe { nil }
-}
-
-struct LinkedList {
-mut:
-	head &Node = unsafe { nil }
-	tail &Node = unsafe { nil }
-}
+const buffer_size = 140
+const response_body = '{ "message": "Hello, world!" }'
+const response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${response_body.len}\r\nConnection: close\r\n\r\n${response_body}'
 
 struct Server {
 mut:
-	server_socket net.TcpListener
-	client_queue  LinkedList
-	queue_lock    sync.Mutex
-	client_count  u32
+	server_socket    int
+	client_queue     [max_waiting_queue_size]int
+	queue_head       int
+	queue_tail       int
+	queue_lock       sync.Mutex
+	client_count     u32
+	has_clients      bool
+	thread_pool_size u32 = u32(8)
+	shutdown_flag    bool
 }
 
-@[unsafe]
-fn (list &LinkedList) free() {
-	mut current := list.head
-	for current != unsafe { nil } {
-		mut next := current.next
-		current.next = unsafe { nil }
-		unsafe { free(current) }
-		current = next
-	}
-	list.head = unsafe { nil }
-	list.tail = unsafe { nil }
-}
-
-fn (mut ll LinkedList) enqueue(client net.TcpConn) {
-	new_node := &Node{
-		client: client
-	}
-	if ll.tail == unsafe { nil } {
-		ll.head = new_node
-		ll.tail = new_node
+// Enqueues a client connection
+fn (mut s Server) enqueue_client(client int) {
+	s.queue_lock.lock()
+	if s.client_count < max_waiting_queue_size {
+		s.client_queue[s.queue_tail] = client
+		s.queue_tail = (s.queue_tail + 1) % max_waiting_queue_size
+		s.client_count++
+		s.has_clients = true
 	} else {
-		ll.tail.next = new_node
-		ll.tail = new_node
+		C.close(client)
 	}
+	s.queue_lock.unlock()
 }
 
-fn (mut ll LinkedList) dequeue() ?net.TcpConn {
-	if ll.head == unsafe { nil } {
-		return none
-	}
-	client := ll.head.client
-	ll.head = ll.head.next
-	if ll.head == unsafe { nil } {
-		ll.tail = unsafe { nil }
+// Dequeues a client connection
+fn (mut s Server) dequeue_client() int {
+	mut client := -1
+	for {
+		s.queue_lock.lock()
+		if s.client_count > 0 {
+			client = s.client_queue[s.queue_head]
+			s.queue_head = (s.queue_head + 1) % max_waiting_queue_size
+			s.client_count--
+			if s.client_count == 0 {
+				s.has_clients = false
+			}
+			s.queue_lock.unlock()
+			break
+		}
+		s.queue_lock.unlock()
+		time.sleep(100 * time.microsecond)
 	}
 	return client
 }
 
-fn (mut s Server) enqueue_client(client net.TcpConn) {
-	s.queue_lock.@lock()
-	s.client_queue.enqueue(client)
-	s.queue_lock.unlock()
-	C.atomic_fetch_add_u32(&s.client_count, 1)
-}
-
-fn (mut s Server) dequeue_client() net.TcpConn {
-	for {
-		if C.atomic_load_u32(&s.client_count) > 0 {
-			s.queue_lock.@lock()
-			client := s.client_queue.dequeue() or {
-				s.queue_lock.unlock()
-				continue
-			}
-			s.queue_lock.unlock()
-			C.atomic_fetch_sub_u32(&s.client_count, 1)
-			return client
-		}
-		time.sleep(100 * time.microsecond)
-	}
-
-	return net.TcpConn{}
-}
-
+// Worker thread function
 fn (mut s Server) worker_thread() {
 	for {
-		mut client := s.dequeue_client()
-		mut buffer := []u8{len: 1024}
-		client.read(mut buffer) or { continue }
-		client.write(unsafe { response.str.vbytes(response.len) }) or { continue }
-		// client.write_string(response) or { continue }
-		client.close() or { continue }
+		if s.shutdown_flag {
+			break
+		}
+		client := s.dequeue_client()
+		if client < 0 {
+			continue
+		}
+		buffer := [buffer_size]u8{}
+		if C.recv(client, &buffer[0], buffer_size, 0) <= 0 {
+			C.close(client)
+			continue
+		}
+		C.send(client, response.str, response.len, 0)
+		C.close(client)
+	}
+}
+
+fn (server Server) client_count_monitor() {
+	for {
+		if server.shutdown_flag {
+			break
+		}
+		println('Client count: ${server.client_count}')
+		time.sleep(1 * time.second)
 	}
 }
 
 fn main() {
 	mut server := &Server{
-		server_socket: net.listen_tcp(.ip6, ':${port}') or { panic(err) }
+		server_socket: C.socket(AddrFamily.ip, SocketType.tcp, 0)
 	}
 
-	for _ in 0 .. num_workers {
+	if server.server_socket < 0 {
+		eprintln('socket failed')
+		return
+	}
+
+	opt := 1
+	C.setsockopt(server.server_socket, C.SOL_SOCKET, C.SO_REUSEADDR | C.SO_REUSEPORT,
+		&opt, sizeof(opt))
+
+	address := C.sockaddr_in{
+		sin_family: AddrFamily.ip
+		sin_port:   C.htons(port)
+		sin_addr:   C.INADDR_ANY
+	}
+	if C.bind(server.server_socket, &address, sizeof(address)) < 0
+		|| C.listen(server.server_socket, backlog) < 0 {
+		eprintln('bind or listen failed')
+		return
+	}
+
+	println('Listening on http://localhost:${port}')
+
+	for i := 0; i < server.thread_pool_size; i++ {
 		spawn server.worker_thread()
 	}
+	// spawn server.client_count_monitor()
 
+	mut addrlen := sizeof(address)
 	for {
-		mut client := server.server_socket.accept() or { continue }
-		// client.set_blocking(false) or { panic(err) }
+		client := C.accept(server.server_socket, &address, &addrlen)
+		if client < 0 {
+			eprintln('accept failed')
+			continue
+		}
 		server.enqueue_client(client)
 	}
 }
