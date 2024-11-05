@@ -24,6 +24,7 @@ Transfer/sec:     48.26MB
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <stdatomic.h>
+#include <signal.h>
 
 #define PORT 8081
 #define BUFFER_SIZE 140
@@ -35,6 +36,8 @@ Transfer/sec:     48.26MB
 
 // Global atomic flag for synchronizing access to shared resources
 atomic_flag lock = ATOMIC_FLAG_INIT;
+int server_fd, epoll_fd;
+pthread_t threads[MAX_THREAD_POOL_SIZE];
 
 // Function prototypes
 void set_blocking(int fd, int blocking);
@@ -46,6 +49,7 @@ void handle_client_closure(int client_fd);
 void process_events(int epoll_fd);
 void *worker_thread(void *arg);
 void event_loop(int server_fd, int epoll_fd);
+void cleanup(int signum);
 
 // Function to set a socket to non-blocking mode
 void set_blocking(int fd, int blocking)
@@ -222,15 +226,38 @@ void event_loop(int server_fd, int epoll_fd)
     }
 }
 
+// Cleanup function to handle termination signals
+void cleanup(int signum)
+{
+    printf("Terminating...\n");
+
+    // Cleanup worker threads
+    for (int i = 0; i < INITIAL_THREAD_POOL_SIZE; i++)
+    {
+        pthread_cancel(threads[i]);
+        pthread_join(threads[i], NULL);
+    }
+
+    // Close file descriptors
+    close(epoll_fd);
+    close(server_fd);
+
+    exit(0);
+}
+
 int main()
 {
-    int server_fd = create_server_socket();
+    // Register signal handler for cleanup
+    signal(SIGINT, cleanup);
+    signal(SIGTERM, cleanup);
+
+    server_fd = create_server_socket();
     if (server_fd < 0)
     {
         return -1;
     }
 
-    int epoll_fd = epoll_create1(0);
+    epoll_fd = epoll_create1(0);
     if (epoll_fd < 0)
     {
         perror("epoll_create1 failed");
@@ -251,7 +278,6 @@ int main()
     atomic_flag_clear(&lock); // Release the lock
 
     // Start worker threads
-    pthread_t threads[MAX_THREAD_POOL_SIZE];
     for (int i = 0; i < INITIAL_THREAD_POOL_SIZE; i++)
     {
         pthread_create(&threads[i], NULL, worker_thread, &epoll_fd);
@@ -260,13 +286,5 @@ int main()
     // Start the event loop for accepting clients
     event_loop(server_fd, epoll_fd);
 
-    // Cleanup
-    for (int i = 0; i < INITIAL_THREAD_POOL_SIZE; i++)
-    {
-        pthread_cancel(threads[i]);
-        pthread_join(threads[i], NULL);
-    }
-    close(epoll_fd);
-    close(server_fd);
     return 0;
 }
