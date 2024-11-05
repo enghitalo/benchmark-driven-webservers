@@ -4,11 +4,11 @@ curl --verbose  http://127.0.0.1:8081
 wrk -t16 -c512 -d60s http://127.0.0.1:8081
 
 Running 1m test @ http://127.0.0.1:8081
-  16 threads and 512 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.33ms    1.08ms  15.57ms   77.72%
-    Req/Sec    25.85k     1.68k   37.86k    72.07%
-  24698685 requests in 1.00m, 2.83GB read
+    16 threads and 512 connections
+    Thread Stats   Avg      Stdev     Max   +/- Stdev
+        Latency     1.33ms    1.08ms  15.57ms   77.72%
+        Req/Sec    25.85k     1.68k   37.86k    72.07%
+    24698685 requests in 1.00m, 2.83GB read
 Requests/sec: 411388.60
 Transfer/sec:     48.26MB
 */
@@ -23,6 +23,7 @@ Transfer/sec:     48.26MB
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <stdatomic.h>
 
 #define PORT 8081
 #define BUFFER_SIZE 140
@@ -32,8 +33,8 @@ Transfer/sec:     48.26MB
 #define INITIAL_THREAD_POOL_SIZE 8
 #define MAX_THREAD_POOL_SIZE 16
 
-// Global mutex for synchronizing access to shared resources
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+// Global atomic flag for synchronizing access to shared resources
+atomic_flag lock = ATOMIC_FLAG_INIT;
 
 // Function prototypes
 void set_blocking(int fd, int blocking);
@@ -135,12 +136,13 @@ void handle_accept(int server_fd, int epoll_fd)
         set_blocking(client_fd, 0); // Set client socket to non-blocking
 
         // Locking to protect the epoll instance
-        pthread_mutex_lock(&mutex);
+        while (atomic_flag_test_and_set(&lock))
+            ; // Spin until the lock is acquired
         if (add_fd_to_epoll(epoll_fd, client_fd, EPOLLIN | EPOLLET) == -1)
         {
             close(client_fd);
         }
-        pthread_mutex_unlock(&mutex);
+        atomic_flag_clear(&lock); // Release the lock
     }
 }
 
@@ -149,9 +151,10 @@ void handle_client_closure(int client_fd)
 {
     // printf("Closing connection: %d\n", client_fd);
     // Locking to protect the epoll instance
-    pthread_mutex_lock(&mutex);
+    while (atomic_flag_test_and_set(&lock))
+        ; // Spin until the lock is acquired
     remove_fd_from_epoll(client_fd, client_fd);
-    pthread_mutex_unlock(&mutex);
+    atomic_flag_clear(&lock); // Release the lock
 }
 
 // Function to process events from epoll
@@ -236,15 +239,16 @@ int main()
     }
 
     // Locking to protect the epoll instance
-    pthread_mutex_lock(&mutex);
+    while (atomic_flag_test_and_set(&lock))
+        ; // Spin until the lock is acquired
     if (add_fd_to_epoll(epoll_fd, server_fd, EPOLLIN) == -1)
     {
         close(server_fd);
         close(epoll_fd);
-        pthread_mutex_unlock(&mutex);
+        atomic_flag_clear(&lock); // Release the lock
         return -1;
     }
-    pthread_mutex_unlock(&mutex);
+    atomic_flag_clear(&lock); // Release the lock
 
     // Start worker threads
     pthread_t threads[MAX_THREAD_POOL_SIZE];
@@ -262,7 +266,6 @@ int main()
         pthread_cancel(threads[i]);
         pthread_join(threads[i], NULL);
     }
-    pthread_mutex_destroy(&mutex);
     close(epoll_fd);
     close(server_fd);
     return 0;
