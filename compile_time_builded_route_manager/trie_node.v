@@ -1,12 +1,17 @@
 module main
 
-import benchmark
-
 struct MethodNode {
 	method_str &u8 = unsafe { nil }
 	method_len int
-	handler    ?fn ()
+	handler    ?fn (string)
 	next       &MethodNode = unsafe { nil }
+}
+
+fn (m &TrieNode) str() string {
+	unsafe {
+		println(m.segment_str.vstring_with_len(m.segment_len)) // users999
+	}
+	return 'm.str()'
 }
 
 struct TrieNode {
@@ -15,6 +20,8 @@ struct TrieNode {
 mut:
 	children map[string]&TrieNode
 	methods  &MethodNode = unsafe { nil }
+	is_param bool
+	param_name string
 }
 
 // Split path into segments
@@ -23,31 +30,34 @@ fn split_path(path string) []string {
 }
 
 // Create a new Trie node with a segment as a raw byte pointer
-fn create_trie_node(segment_str &u8, segment_len int) &TrieNode {
+fn create_trie_node(segment_str &u8, segment_len int, is_param bool, param_name string) &TrieNode {
 	return &TrieNode{
 		segment_str: unsafe { segment_str }
 		segment_len: segment_len
 		children:    map[string]&TrieNode{}
+		is_param:    is_param
+		param_name:  param_name
 	}
 }
 
 // Insert a route into the Trie
-fn insert_route(mut root TrieNode, path string, method_str &u8, method_len int, handler fn ()) {
+fn insert_route(mut root TrieNode, path string, method_str &u8, method_len int, handler fn (string)) {
 	segments := split_path(path)
 	mut current := unsafe { &root }
 
 	for segment in segments {
 		segment_ptr := segment.str
 		segment_len := segment.len
+		is_param := segment.starts_with(':')
+		param_name := if is_param { segment[1..] } else { '' }
 
 		// Check if a child with the same segment exists
-		segment_key := segment
-		// dump(segment_key)
+		segment_key := if is_param { ':' } else { segment }
 		if segment_key in current.children {
 			current = current.children[segment_key] or { return }
 		} else {
 			// If no child matches, create a new node for this segment
-			child_node := create_trie_node(segment_ptr, segment_len)
+			child_node := create_trie_node(segment_ptr, segment_len, is_param, param_name)
 			current.children[segment_key] = child_node
 			current = child_node
 		}
@@ -64,9 +74,10 @@ fn insert_route(mut root TrieNode, path string, method_str &u8, method_len int, 
 }
 
 // Search for a route in the Trie
-fn search_route(mut root TrieNode, path string, method &u8, method_len int) ?fn () {
+fn search_route(mut root TrieNode, path string, method &u8, method_len int) ?fn (string) {
 	segments := split_path(path)
 	mut current := unsafe { &root }
+	mut params := map[string]string{}
 
 	for segment in segments {
 		segment_key := segment
@@ -74,6 +85,9 @@ fn search_route(mut root TrieNode, path string, method &u8, method_len int) ?fn 
 		// Check for the segment in the Trie
 		if segment_key in current.children {
 			current = current.children[segment_key] or { return none }
+		} else if ':' in current.children {
+			current = current.children[':'] or { return none }
+			params[current.param_name] = segment_key
 		} else {
 			return none // Path not found
 		}
@@ -84,7 +98,9 @@ fn search_route(mut root TrieNode, path string, method &u8, method_len int) ?fn 
 	for method_node != unsafe { nil } {
 		if method_node.method_len == method_len {
 			if unsafe { vmemcmp(method_node.method_str, method, method_len) } == 0 {
-				return method_node.handler
+				// return fn (id string) {
+					return method_node.handler// or { return }(params['id'])
+				// }
 			}
 		}
 		method_node = method_node.next
@@ -94,77 +110,42 @@ fn search_route(mut root TrieNode, path string, method &u8, method_len int) ?fn 
 }
 
 // Example handler function
-fn example_handler() {
+fn example_handler(id string) {
 	println('Handler called!')
 }
 
-pub struct ControllerPath {
-pub:
-	method  string
-	path    []string
-	handler ?fn () = unsafe { nil }
+// Example handler function
+fn example_handler1(id string) {
+	println('Handler different called!')
+}
+
+// Example handler function with id
+fn example_handler_with_id(id string) {
+	println('Handler called with id ${id}')
 }
 
 fn main() {
 	println('builded')
-	mut root := create_trie_node(unsafe { nil }, 0)
+	mut root := create_trie_node(unsafe { nil }, 0, false, '')
 
 	// Insert a route with method and path as raw bytes
-	// method := 'GET'
 	methods := ['GET', 'POST', 'PUT', 'DELETE']
 
-	mut controllers := []ControllerPath{}
+	insert_route(mut root, '/api/v1', methods[0].str, methods[0].len, example_handler1)
+	insert_route(mut root, '/api/v1/users999', methods[0].str, methods[0].len, example_handler)
+	insert_route(mut root, '/api/v1/users/:id', methods[0].str, methods[0].len, example_handler_with_id)
 
-	mut b := benchmark.start()
-	for method in methods {
-		for i in 0 .. 1_000 {
-			controllers << ControllerPath{
-				method:  method
-				path:    '/api/v1/users${i}'.split('/')
-				handler: example_handler
-			}
-		}
-	}
-
-	b.measure(('create_controllers'))
-
-	for method in methods {
-		for _ in 0 .. 1_000 {
-			_ := old_search_route(controllers, '/api/v1/users999', method) or {
-				println('Route not found! in old_search_route')
-				return
-			}
-		}
-	}
-
-	b.measure(('old_search_route'))
-
-	for method in methods {
-		for i in 0 .. 1_000 {
-			insert_route(mut root, '/api/v1/users${i}', method.str, method.len, example_handler)
-		}
-	}
-
-	b.measure(('insert_route'))
-
-	for method in methods {
-		for _ in 0 .. 1_000 {
-			// Search for the route with method as raw bytes
-			_ := search_route(mut root, '/api/v1/users999', method.str, method.len) or {
-				println('Route not found! in search_route')
-				return
-			}
-		}
-	}
-
-	b.measure(('search_route'))
-}
-
-fn old_search_route(controllers []ControllerPath, path string, method string) ?fn () {
-	for controller in controllers {
-		if controller.path.join('/') == path && controller.method == method {
-			return controller.handler
-		}
-	}
-	return none
+	// Search for the route with method as raw bytes
+	// will call example_handler_with_id
+	search_route(mut root, '/api/v1/users/999', methods[0].str, methods[0].len) or {
+		println('Route not found1')
+		return
+	}('999')
+	search_route(mut root, '/api/v1/users999', methods[0].str, methods[0].len) or {
+		println('Route not found1')
+		return
+	}('')
+	search_route(mut root, '/api/v1', methods[0].str, methods[0].len)?('')
+	search_route(mut root, '/users999', methods[0].str, methods[0].len)?('')
+	search_route(mut root, '/api', methods[0].str, methods[0].len)?('')
 }
