@@ -10,6 +10,8 @@ Running 30s test @ http://127.0.0.1:8080
 Requests/sec: 119535.90
 Transfer/sec:     13.68MB
 */
+module circular_queue
+
 import sync
 import time
 
@@ -53,11 +55,14 @@ mut:
 }
 
 const port = 8080
-const max_waiting_queue_size = 512
-const backlog = 512
 const buffer_size = 140
 const response_body = '{ "message": "Hello, world!" }'
-const response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${response_body.len}\r\nConnection: close\r\n\r\n${response_body}'
+const max_waiting_queue_size = 512
+const initial_thread_pool_size = 8
+const max_thread_pool_size = 8
+const response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${response_body.len}\r\nConnection: keep-alive\r\n\r\n${response_body}'
+
+const backlog = 512
 
 struct Server {
 mut:
