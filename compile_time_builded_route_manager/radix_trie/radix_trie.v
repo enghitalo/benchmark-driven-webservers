@@ -28,12 +28,12 @@ fn (mut router Router) add_route(method string, path string, handler fn (params 
 		segment_key := if is_param { ':' } else { segment }
 		if segment_key !in node.children {
 			node.children[segment_key] = &RadixNode{
-				children: map[string]&RadixNode{}
-				is_param: is_param
+				children:   map[string]&RadixNode{}
+				is_param:   is_param
 				param_name: if is_param { segment[1..] } else { '' }
 			}
 		}
-		node = node.children[segment_key] or { panic("Unexpected radix trie error") }
+		node = node.children[segment_key] or { panic('Unexpected radix trie error') }
 	}
 	node.handler = handler
 }
@@ -76,7 +76,7 @@ fn (mut router Router) handle_request(method string, path string) !string {
 // Example handlers
 fn get_user(params map[string]string) !string {
 	if id := params['id'] {
-		return 'GET user with ID $id'
+		return 'GET user with ID ${id}'
 	}
 	return 'GET all users'
 }
@@ -87,24 +87,26 @@ fn create_user(params map[string]string) !string {
 
 fn update_user(params map[string]string) !string {
 	id := params['id'] or { return error('User ID required') }
-	return 'PUT update user with ID $id'
+	return 'PUT update user with ID ${id}'
 }
 
 fn delete_user(params map[string]string) !string {
 	id := params['id'] or { return error('User ID required') }
-	return 'DELETE user with ID $id'
+	return 'DELETE user with ID ${id}'
 }
 
 fn update_user_name(params map[string]string) !string {
 	id := params['id'] or { return error('User ID required') }
 	name := params['name'] or { return error('User name required') }
-	return 'PUT update user with ID $id to name $name'
+	return 'PUT update user with ID ${id} to name ${name}'
 }
 
 // Initialize the router and add the routes
 fn setup_router() Router {
 	mut router := Router{
-		root: RadixNode{children: map[string]&RadixNode{}}
+		root: RadixNode{
+			children: map[string]&RadixNode{}
+		}
 	}
 
 	// Adding routes with handler functions
@@ -141,7 +143,7 @@ fn bench() ! {
 
 	mut b := benchmark.start()
 
-	for _ in 0..100000 {
+	for _ in 0 .. 100000 {
 		router.handle_request('GET', '/user')!
 		router.handle_request('GET', '/user/123')!
 		router.handle_request('POST', '/user')!
