@@ -1,11 +1,13 @@
 module main
 
 import sync
+import os
 
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <errno.h>
+#include <stdio.h>
 
 // https://man7.org/linux/man-pages/man2/socket.2.html
 pub enum SocketType {
@@ -62,29 +64,39 @@ fn C.accept(sockfd int, address &C.sockaddr_in, addrlen &u32) int
 
 fn C.setsockopt(sockfd int, level int, optname int, optval &int, optlen u32) int
 
-fn C.recv(sockfd int, buffer &u8, len u32, flags int) int
+fn C.recv(sockfd int, request_buffer voidptr, len usize, flags int) int
 
-fn C.send(sockfd int, buffer &u8, len u32, flags int) int
+fn C.send(sockfd int, response_buffer voidptr, len usize, flags int) int
 
 fn C.epoll_create1(flags int) int
 
 fn C.epoll_ctl(epfd int, op int, fd int, event &EpollEvent) int
 
+// fn C.epoll_ctl(epfd int, op int, fd int, event &EpollEvent) int
+
+// fn C.epoll_wait(epfd int, events &EpollEvent, maxevents int, timeout int) int
+
+// fn C.epoll_wait(int, &C.epoll_event, int, int) int
+// fn C.epoll_wait(int, voidptr, int, int) int
 fn C.epoll_wait(epfd int, events &EpollEvent, maxevents int, timeout int) int
 
 fn C.fcntl(fd int, cmd int, arg int) int
 
 fn C.close(fd int) int
 
+fn C.pthread_cancel(_thread thread) int
+
+fn C.pthread_join(_thread thread, retval &voidptr) int
+
+fn C.perror(s &u8) voidptr
+
 struct Server {
 mut:
-	server_socket    int
-	epoll_fd         int
-	lock_flag        sync.Mutex
-	client_count     u32
-	has_clients      bool
-	thread_pool_size u32 = u32(8)
-	threads          [max_thread_pool_size]thread
+	server_socket int
+	epoll_fd      int
+	lock_flag     sync.Mutex
+	has_clients bool
+	threads     [max_thread_pool_size]thread
 }
 
 pub struct C.sockaddr_in {
@@ -95,13 +107,12 @@ mut:
 	sin_zero   [8]u8
 }
 
-const port = 8081
+const port = 8082
 const buffer_size = 140
-const response_body = '{ "message": "Hello, world!" }'
+const response_body = '{"message": "Hello, world!"}'
 const max_connection_size = 512
-const initial_thread_pool_size = 8
 const max_thread_pool_size = 16
-const response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${response_body.len}\r\nConnection: keep-alive\r\n\r\n${response_body}'
+const response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${response_body.len}\r\nConnection: keep-alive\r\n\r\n${response_body}'.bytes()
 
 union Epoll_data_t {
 	ptr voidptr
@@ -131,7 +142,17 @@ fn set_blocking(fd int, blocking bool) {
 fn create_server_socket() int {
 	server_fd := C.socket(int(AddrFamily.ip), C.SOCK_STREAM | C.SOCK_NONBLOCK, 0)
 	if server_fd < 0 {
-		eprintln('Socket creation failed')
+		eprintln(@LOCATION)
+		C.perror('Socket creation failed'.str)
+		return -1
+	}
+
+	// Enable SO_REUSEPORT
+	optval := 1
+	if C.setsockopt(server_fd, C.SOL_SOCKET, C.SO_REUSEPORT, &optval, sizeof(optval)) < 0 {
+		eprintln(@LOCATION)
+		C.perror('setsockopt SO_REUSEPORT failed'.str)
+		C.close(server_fd)
 		return -1
 	}
 
@@ -142,12 +163,14 @@ fn create_server_socket() int {
 	}
 
 	if C.bind(server_fd, &server_address, sizeof(server_address)) < 0 {
-		eprintln('Bind failed')
+		eprintln(@LOCATION)
+		C.perror('Bind failed'.str)
 		C.close(server_fd)
 		return -1
 	}
 	if C.listen(server_fd, max_connection_size) < 0 {
-		eprintln('Listen failed')
+		eprintln(@LOCATION)
+		C.perror('Listen failed'.str)
 		C.close(server_fd)
 		return -1
 	}
@@ -163,7 +186,8 @@ fn add_fd_to_epoll(epoll_fd int, fd int, events u32) int {
 		}
 	}
 	if C.epoll_ctl(epoll_fd, C.EPOLL_CTL_ADD, fd, &ev) == -1 {
-		eprintln('epoll_ctl: fd')
+		eprintln(@LOCATION)
+		C.perror('epoll_ctl'.str)
 		return -1
 	}
 	return 0
@@ -174,7 +198,8 @@ fn remove_fd_from_epoll(epoll_fd int, fd int) {
 	C.epoll_ctl(epoll_fd, C.EPOLL_CTL_DEL, fd, (unsafe { nil }))
 }
 
-fn handle_accept(server_fd int, epoll_fd int, lock_flag &sync.Mutex) {
+// Updated handle_accept function to use atomic client count
+fn handle_accept(server_fd int, epoll_fd int, lock_flag &sync.Mutex, server &Server) {
 	for {
 		client_fd := C.accept(server_fd, unsafe { nil }, unsafe { nil })
 		if client_fd < 0 {
@@ -182,7 +207,9 @@ fn handle_accept(server_fd int, epoll_fd int, lock_flag &sync.Mutex) {
 			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 				break // No more incoming connections; exit loop.
 			}
-			eprintln('Accept failed with error code: ${C.errno}')
+
+			eprintln(@LOCATION)
+			C.perror('Accept failed'.str)
 			return
 		}
 
@@ -190,118 +217,122 @@ fn handle_accept(server_fd int, epoll_fd int, lock_flag &sync.Mutex) {
 		set_blocking(client_fd, false)
 
 		// Protect epoll operations with mutex
-		lock {
-			if add_fd_to_epoll(epoll_fd, client_fd, u32(C.EPOLLIN | C.EPOLLET)) == -1 {
-				C.close(client_fd) // Close client socket if adding to epoll fails
-			}
+		unsafe {
+			lock_flag.lock()
+		}
+		if add_fd_to_epoll(epoll_fd, client_fd, u32(C.EPOLLIN | C.EPOLLET)) == -1 {
+			C.close(client_fd)
+		}
+		unsafe {
+			lock_flag.unlock()
 		}
 	}
 }
 
-
-// Function to handle client closure
-fn handle_client_closure(client_fd int, epoll_fd int, lock_flag &sync.Mutex) {
-	// lock_flag.lock()
+// Handle client closure with atomic client count decrement
+fn handle_client_closure(client_fd int, epoll_fd int, lock_flag &sync.Mutex, server &Server) {
+	unsafe {
+		lock_flag.lock()
+	}
 	remove_fd_from_epoll(epoll_fd, client_fd)
-	// lock_flag.unlock()
-	C.close(client_fd)
+	unsafe {
+		lock_flag.unlock()
+	}
 }
 
-// Function to process events from epoll
-fn process_events(epoll_fd int, lock_flag &sync.Mutex) {
+// Process events from epoll with updated client count management
+fn process_events(epoll_fd int, lock_flag &sync.Mutex, server &Server) {
 	events := [max_connection_size]EpollEvent{}
-	num_events := C.epoll_wait(epoll_fd, &events[0], max_connection_size, -1)
+	num_events := C.epoll_wait(epoll_fd, voidptr(&events[0]), max_connection_size, -1)
 	for i := 0; i < num_events; i++ {
 		if events[i].events & (C.EPOLLHUP | C.EPOLLERR) != 0 {
-			handle_client_closure(unsafe { events[i].data.fd }, epoll_fd, lock_flag)
+			handle_client_closure(unsafe { events[i].data.fd }, epoll_fd, lock_flag, server)
 			continue
 		}
 
-		if events[i].events & C.EPOLLIN != 0 {
-			mut buffer := [buffer_size]u8{}
-
-			bytes_read := C.recv(unsafe { events[i].data.fd }, &buffer[0], sizeof(buffer) - 1,
+		if (events[i].events & C.EPOLLIN) != 0 {
+			mut request_buffer := []u8{len: buffer_size}
+			bytes_read := C.recv(unsafe { events[i].data.fd }, request_buffer.data, buffer_size - 1,
 				0)
 
 			if bytes_read > 0 {
-				// Send the response back to the client
-				buffer[bytes_read] = u8(0)
-
-				C.send(unsafe { events[i].data.fd }, response.str, response.len, 0)
-				handle_client_closure(unsafe { events[i].data.fd }, epoll_fd, lock_flag)
+				request_buffer[bytes_read] = `\0` // Null-terminate the request_buffer
+				C.send(unsafe { events[i].data.fd }, response.data, response.len, 0)
+				handle_client_closure(unsafe { events[i].data.fd }, epoll_fd, lock_flag,
+					server)
 			} else if bytes_read == 0
 				|| (bytes_read < 0 && C.errno != C.EAGAIN && C.errno != C.EWOULDBLOCK) {
-				handle_client_closure(unsafe { events[i].data.fd }, epoll_fd, lock_flag)
+				handle_client_closure(unsafe { events[i].data.fd }, epoll_fd, lock_flag,
+					server)
 			}
 		}
 	}
 }
 
 // Worker thread function
-fn worker_thread(epoll_fd int, lock_flag &sync.Mutex) {
+fn worker_thread(epoll_fd int, lock_flag &sync.Mutex, server &Server) {
 	for {
-		process_events(epoll_fd, lock_flag)
+		process_events(epoll_fd, lock_flag, server)
 	}
 }
 
 // Event loop for accepting clients
-fn event_loop(server_fd int, epoll_fd int, lock_flag &sync.Mutex) {
+fn event_loop(server_fd int, epoll_fd int, lock_flag &sync.Mutex, server &Server) {
 	for {
-		handle_accept(server_fd, epoll_fd, lock_flag)
+		handle_accept(server_fd, epoll_fd, lock_flag, server)
 	}
 }
 
-fn cleanup(mut server Server) {
+fn cleanup(mut server Server, threads [max_thread_pool_size]thread) {
 	println('Terminating...\n')
-	for i := 0; i < server.thread_pool_size; i++ {
-		// pthread_cancel(threads[i])
-		// pthread_join(threads[i], (unsafe { nil }))
-
-		// server.threads[i].cancel()
-		// server.threads[i].join(unsafe { nil })
+	server.lock_flag.lock()
+	for i := 0; i < max_thread_pool_size; i++ {
+		C.pthread_cancel(threads[i])
+		C.pthread_join(threads[i], (unsafe { nil }))
 	}
+	server.lock_flag.unlock()
+
 	C.close(server.server_socket)
 	C.close(server.epoll_fd)
-
 	println('Server terminated')
+	exit(0)
 }
 
 fn main() {
 	mut server := Server{}
-	// os.signal_opt(.int, fn [mut server] (signum os.Signal) {
-	// 	cleanup(mut server)
-	// })!
-	// os.signal_opt(.term, fn [mut server] (signum os.Signal) {
-	// 	cleanup(mut server)
-	// })!
-	server.lock_flag = sync.new_mutex()
+	os.signal_opt(.int, fn [mut server] (signum os.Signal) {
+		cleanup(mut server, server.threads)
+	})!
+	os.signal_opt(.term, fn [mut server] (signum os.Signal) {
+		cleanup(mut server, server.threads)
+	})!
 
-	// Create server socket and epoll instance
 	server.server_socket = create_server_socket()
 	if server.server_socket < 0 {
 		return
 	}
 	server.epoll_fd = C.epoll_create1(0)
 	if server.epoll_fd < 0 {
-		eprintln('epoll_create1 failed')
+		eprintln(@LOCATION)
+		C.perror('epoll_create1 failed'.str)
 		C.close(server.server_socket)
 		return
 	}
 
-	server.lock_flag.lock()
 	if add_fd_to_epoll(server.epoll_fd, server.server_socket, u32(C.EPOLLIN)) == -1 {
 		C.close(server.server_socket)
 		C.close(server.epoll_fd)
 		server.lock_flag.unlock()
 		return
 	}
-	server.lock_flag.unlock()
 
 	// Start worker threads
-	for i in 0 .. initial_thread_pool_size {
-		server.threads[i] = spawn worker_thread(server.epoll_fd, &server.lock_flag)
+	for i in 0 .. max_thread_pool_size {
+		server.threads[i] = spawn worker_thread(server.epoll_fd, &server.lock_flag, &server)
 	}
 
+	println('Server started on http://localhost:${port}\n')
+
 	// Start the event loop for accepting clients
-	event_loop(server.server_socket, server.epoll_fd, &server.lock_flag)
+	event_loop(server.server_socket, server.epoll_fd, &server.lock_flag, &server)
 }

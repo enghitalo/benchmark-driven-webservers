@@ -23,35 +23,38 @@ Transfer/sec:     48.26MB
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
-#include <stdatomic.h>
 #include <signal.h>
 
-#define PORT 8081
+#define PORT 8082
 #define BUFFER_SIZE 140
 #define RESPONSE_BODY "{\"message\": \"Hello, world!\"}"
 #define RESPONSE_BODY_LENGTH (sizeof(RESPONSE_BODY) - 1)
 #define MAX_CONNECTION_SIZE 512
-#define INITIAL_THREAD_POOL_SIZE 8
 #define MAX_THREAD_POOL_SIZE 16
 
-// Global atomic flag for synchronizing access to shared resources
-atomic_flag lock = ATOMIC_FLAG_INIT;
-int server_fd, epoll_fd;
-pthread_t threads[MAX_THREAD_POOL_SIZE];
+// Struct to hold server information
+struct server
+{
+    int server_socket;
+    int epoll_fd;
+    pthread_mutex_t lock_flag;
+    int has_clients;
+    pthread_t threads[MAX_THREAD_POOL_SIZE];
+};
 
 // Function prototypes
 void set_blocking(int fd, int blocking);
 int create_server_socket();
 int add_fd_to_epoll(int epoll_fd, int fd, uint32_t events);
 void remove_fd_from_epoll(int epoll_fd, int fd);
-void handle_accept(int server_fd, int epoll_fd);
-void handle_client_closure(int client_fd);
-void process_events(int epoll_fd);
+void handle_accept(struct server *srv);
+void handle_client_closure(struct server *srv, int client_fd);
+void process_events(struct server *srv);
 void *worker_thread(void *arg);
-void event_loop(int server_fd, int epoll_fd);
-void cleanup(int signum);
+void event_loop(struct server *srv);
+void cleanup(int signum, struct server *srv);
 
-// Function to set a socket to non-blocking mode
+// Função para configurar o modo não-bloqueante de um socket
 void set_blocking(int fd, int blocking)
 {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -75,6 +78,15 @@ int create_server_socket()
     if (server_fd < 0)
     {
         perror("Socket creation failed");
+        return -1;
+    }
+
+    // Enable SO_REUSEPORT option
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0)
+    {
+        perror("setsockopt(SO_REUSEPORT) failed");
+        close(server_fd);
         return -1;
     }
 
@@ -102,7 +114,7 @@ int create_server_socket()
     return server_fd;
 }
 
-// Function to add a file descriptor to the epoll instance
+// Adicionar o descritor de arquivo ao epoll
 int add_fd_to_epoll(int epoll_fd, int fd, uint32_t events)
 {
     struct epoll_event ev;
@@ -117,22 +129,25 @@ int add_fd_to_epoll(int epoll_fd, int fd, uint32_t events)
     return 0;
 }
 
-// Function to remove a file descriptor from the epoll instance
+// Remover descritor do epoll
 void remove_fd_from_epoll(int epoll_fd, int fd)
 {
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
 }
 
-// Function to handle client acceptance
-void handle_accept(int server_fd, int epoll_fd)
+// Função para aceitar conexões de clientes
+void handle_accept(struct server *srv)
 {
     while (1)
     {
-        int client_fd = accept(server_fd, NULL, NULL);
+        //   event_loop(srv.server_socket, srv.epoll_fd);
+        int client_fd = accept(srv->server_socket, NULL, NULL);
         if (client_fd < 0)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
                 break; // No more connections to accept
+            }
             perror("Accept failed");
             return;
         }
@@ -140,51 +155,62 @@ void handle_accept(int server_fd, int epoll_fd)
         set_blocking(client_fd, 0); // Set client socket to non-blocking
 
         // Locking to protect the epoll instance
-        while (atomic_flag_test_and_set(&lock))
-            ; // Spin until the lock is acquired
-        if (add_fd_to_epoll(epoll_fd, client_fd, EPOLLIN | EPOLLET) == -1)
+        pthread_mutex_lock(&srv->lock_flag);
+        if (add_fd_to_epoll(srv->epoll_fd, client_fd, EPOLLIN | EPOLLET) == -1)
         {
             close(client_fd);
         }
-        atomic_flag_clear(&lock); // Release the lock
+        pthread_mutex_unlock(&srv->lock_flag); // Release the lock_flag
     }
 }
 
 // Function to handle client closure
-void handle_client_closure(int client_fd)
+void handle_client_closure(struct server *srv, int client_fd)
 {
     // printf("Closing connection: %d\n", client_fd);
     // Locking to protect the epoll instance
-    while (atomic_flag_test_and_set(&lock))
-        ; // Spin until the lock is acquired
+    pthread_mutex_lock(&srv->lock_flag);
     remove_fd_from_epoll(client_fd, client_fd);
-    atomic_flag_clear(&lock); // Release the lock
+    // close(client_fd);
+    pthread_mutex_unlock(&srv->lock_flag); // Release the lock_flag
 }
 
-// Function to process events from epoll
-void process_events(int epoll_fd)
+// Processar eventos com epoll
+void process_events(struct server *srv)
 {
     struct epoll_event events[MAX_CONNECTION_SIZE];
-    int num_events = epoll_wait(epoll_fd, events, MAX_CONNECTION_SIZE, -1);
+    int num_events = epoll_wait(srv->epoll_fd, events, MAX_CONNECTION_SIZE, -1);
 
     for (int i = 0; i < num_events; i++)
     {
         if (events[i].events & (EPOLLHUP | EPOLLERR))
         {
-            handle_client_closure(events[i].data.fd);
+            handle_client_closure(srv, events[i].data.fd);
             continue;
         }
 
         if (events[i].events & EPOLLIN)
         {
-            char buffer[BUFFER_SIZE] = {0};
-            int bytes_read = recv(events[i].data.fd, buffer, sizeof(buffer) - 1, 0);
+            char *request_buffer = malloc(BUFFER_SIZE);
+            if (!request_buffer)
+            {
+                perror("malloc failed");
+                continue;
+            }
+            memset(request_buffer, 0, BUFFER_SIZE);
+            int bytes_read = recv(events[i].data.fd, request_buffer, BUFFER_SIZE - 1, 0);
 
             if (bytes_read > 0)
             {
-                buffer[bytes_read] = '\0'; // Null-terminate the buffer
-                char response[BUFFER_SIZE];
-                int response_length = snprintf(response, sizeof(response),
+                request_buffer[bytes_read] = '\0'; // Null-terminate the request_buffer
+                char *response_buffer = malloc(BUFFER_SIZE);
+                if (!response_buffer)
+                {
+                    perror("malloc failed");
+                    free(request_buffer);
+                    continue;
+                }
+                int response_length = snprintf(response_buffer, BUFFER_SIZE,
                                                "HTTP/1.1 200 OK\r\n"
                                                "Content-Type: application/json\r\n"
                                                "Content-Length: %zu\r\n"
@@ -192,16 +218,17 @@ void process_events(int epoll_fd)
                                                "%s",
                                                RESPONSE_BODY_LENGTH, RESPONSE_BODY);
 
-                // Send the response back to the client
-                send(events[i].data.fd, response, response_length, 0);
+                send(events[i].data.fd, response_buffer, response_length, 0);
 
-                // Close the connection after sending the response
-                handle_client_closure(events[i].data.fd);
+                // Close the connection after sending the response_buffer
+                handle_client_closure(srv, events[i].data.fd);
+                free(response_buffer);
             }
             else if (bytes_read == 0 || (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
             {
-                handle_client_closure(events[i].data.fd);
+                handle_client_closure(srv, events[i].data.fd);
             }
+            free(request_buffer);
         }
     }
 }
@@ -209,82 +236,87 @@ void process_events(int epoll_fd)
 // Worker thread function
 void *worker_thread(void *arg)
 {
-    int epoll_fd = *(int *)arg;
+    struct server *srv = (struct server *)arg;
     while (1)
     {
-        process_events(epoll_fd);
+        process_events(srv);
     }
     return NULL;
 }
 
-// Event loop for accepting clients
-void event_loop(int server_fd, int epoll_fd)
+// Loop principal para aceitar clientes
+void event_loop(struct server *srv)
 {
     while (1)
     {
-        handle_accept(server_fd, epoll_fd);
+        handle_accept(srv);
     }
 }
 
-// Cleanup function to handle termination signals
-void cleanup(int signum)
-{
-    printf("Terminating...\n");
+// // Função de cleanup
+// void cleanup(int signum, struct server *srv)
+// {
+//     printf("Terminating...\n");
 
-    // Cleanup worker threads
-    for (int i = 0; i < INITIAL_THREAD_POOL_SIZE; i++)
-    {
-        pthread_cancel(threads[i]);
-        pthread_join(threads[i], NULL);
-    }
+//     for (int i = 0; i < MAX_THREAD_POOL_SIZE; i++)
+//     {
+//         pthread_cancel(srv->threads[i]);
+//         pthread_join(srv->threads[i], NULL);
+//     }
 
-    // Close file descriptors
-    close(epoll_fd);
-    close(server_fd);
-
-    exit(0);
-}
+//     close(srv->epoll_fd);
+//     close(srv->server_socket);
+//     pthread_mutex_destroy(&srv->lock_flag);
+//     exit(0);
+// }
 
 int main()
 {
-    // Register signal handler for cleanup
-    signal(SIGINT, cleanup);
-    signal(SIGTERM, cleanup);
+    struct server srv;
+    memset(&srv, 0, sizeof(srv));
 
-    server_fd = create_server_socket();
-    if (server_fd < 0)
+    srv.server_socket = create_server_socket();
+    if (srv.server_socket < 0)
     {
         return -1;
     }
 
-    epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0)
+    srv.epoll_fd = epoll_create1(0);
+    if (srv.epoll_fd < 0)
     {
         perror("epoll_create1 failed");
-        close(server_fd);
+        close(srv.server_socket);
         return -1;
     }
 
     // Locking to protect the epoll instance
-    while (atomic_flag_test_and_set(&lock))
-        ; // Spin until the lock is acquired
-    if (add_fd_to_epoll(epoll_fd, server_fd, EPOLLIN) == -1)
+    pthread_mutex_lock(&srv.lock_flag);
+    if (add_fd_to_epoll(srv.epoll_fd, srv.server_socket, EPOLLIN) == -1)
     {
-        close(server_fd);
-        close(epoll_fd);
-        atomic_flag_clear(&lock); // Release the lock
+        close(srv.server_socket);
+        close(srv.epoll_fd);
+        pthread_mutex_unlock(&srv.lock_flag); // Release the lock_flag
         return -1;
     }
-    atomic_flag_clear(&lock); // Release the lock
+    pthread_mutex_unlock(&srv.lock_flag); // Release the lock_flag
+
+    // Initialize the mutex
+    pthread_mutex_init(&srv.lock_flag, NULL);
 
     // Start worker threads
-    for (int i = 0; i < INITIAL_THREAD_POOL_SIZE; i++)
+    for (int i = 0; i < MAX_THREAD_POOL_SIZE; i++)
     {
-        pthread_create(&threads[i], NULL, worker_thread, &epoll_fd);
+        pthread_create(&srv.threads[i], NULL, worker_thread, &srv);
     }
 
-    // Start the event loop for accepting clients
-    event_loop(server_fd, epoll_fd);
+    // // Configura o manipulador de sinal com acesso à estrutura do servidor
+    // struct sigaction sa;
+    // sa.sa_handler = (void (*)(int))cleanup;
+    // sigemptyset(&sa.sa_mask);
+    // sa.sa_flags = 0;
+    // sigaction(SIGINT, &sa, NULL);
+    // sigaction(SIGTERM, &sa, NULL);
 
+    event_loop(&srv);
     return 0;
 }
