@@ -202,7 +202,7 @@ void server_run(Server *server)
         {
             perror("epoll_create1 failed");
             close_socket(server->socket_fd);
-            return;
+            exit(1);
         }
 
         if (add_fd_to_epoll(server->epoll_fds[i], server->socket_fd, EPOLLIN) == -1)
@@ -223,7 +223,7 @@ int main()
 {
     Server server = {
         .port = 8081,
-        .socket_fd = -1,
+        .socket_fd = -1, // Socket file descriptor initialized to -1 because it is not created yet
         .request_handler = NULL};
 
     server_run(&server);
