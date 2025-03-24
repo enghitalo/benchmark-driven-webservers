@@ -6,11 +6,11 @@ wrk -t16 -c512 -d60s http://127.0.0.1:8081
 Running 1m test @ http://127.0.0.1:8081
   16 threads and 512 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   126.59us  141.48us  10.58ms   91.65%
-    Req/Sec    27.60k    10.67k   55.60k    66.64%
-  26363882 requests in 1.00m, 1.28GB read
-Requests/sec: 438734.37
-Transfer/sec:     21.76MB
+    Latency     1.06ms    1.31ms  25.53ms   85.13%
+    Req/Sec    33.37k     6.47k   60.49k    79.34%
+  31890362 requests in 1.00m, 1.54GB read
+Requests/sec: 530632.51
+Transfer/sec:     26.31MB
 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -140,15 +140,18 @@ void handle_accept_loop(Server *server)
     }
 }
 
-void handle_client_closure(Server *server, int client_fd)
+// Define the arg_struct to hold the arguments for the thread function
+struct arg_struct
 {
-    remove_fd_from_epoll(client_fd, client_fd);
-}
+    Server *server;
+    int epoll_fd;
+};
 
-void *process_events(void *arg)
+void *process_events(void *arguments)
 {
-    Server *server = (Server *)arg;
-    int epoll_fd = server->epoll_fds[0]; // Simplified for example
+    struct arg_struct *args = (struct arg_struct *)arguments;
+    Server *server = args->server;
+    int epoll_fd = args->epoll_fd;
 
     while (1)
     {
@@ -159,7 +162,7 @@ void *process_events(void *arg)
         {
             if (events[i].events & (EPOLLHUP | EPOLLERR))
             {
-                handle_client_closure(server, events[i].data.fd);
+                remove_fd_from_epoll(epoll_fd, events[i].data.fd);
                 continue;
             }
 
@@ -170,20 +173,19 @@ void *process_events(void *arg)
 
                 if (bytes_read > 0)
                 {
-
                     // Process request and get response
                     // This would call server->request_handler in a real implementation
                     char *response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
                     send(events[i].data.fd, response, strlen(response), 0);
-                    handle_client_closure(server, events[i].data.fd);
                 }
                 else if (bytes_read == 0 || (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
                 {
-                    handle_client_closure(server, events[i].data.fd);
+                    remove_fd_from_epoll(epoll_fd, events[i].data.fd);
                 }
             }
         }
     }
+    pthread_exit(NULL);
     return NULL;
 }
 
@@ -212,7 +214,17 @@ void server_run(Server *server)
             return;
         }
 
-        pthread_create(&server->threads[i], NULL, process_events, server);
+        struct arg_struct args;
+        args.server = server;
+        args.epoll_fd = server->epoll_fds[i];
+
+        if (pthread_create(&(server->threads[i]), NULL, &process_events, (void *)&args) != 0)
+        {
+            perror("Thread creation failed");
+            close_socket(server->socket_fd);
+            close_socket(server->epoll_fds[i]);
+            exit(EXIT_FAILURE);
+        }
     }
 
     printf("listening on http://localhost:%d/\n", server->port);
