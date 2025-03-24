@@ -66,7 +66,7 @@ int create_server_socket(int port)
     if (server_fd < 0)
     {
         perror("Socket creation failed");
-        return -1;
+        exit(EXIT_FAILURE);
     }
 
     int opt = 1;
@@ -74,7 +74,7 @@ int create_server_socket(int port)
     {
         perror("setsockopt SO_REUSEPORT failed");
         close_socket(server_fd);
-        return -1;
+        exit(EXIT_FAILURE);
     }
 
     struct sockaddr_in server_addr = {
@@ -87,14 +87,14 @@ int create_server_socket(int port)
     {
         perror("Bind failed");
         close_socket(server_fd);
-        return -1;
+        exit(EXIT_FAILURE);
     }
 
     if (listen(server_fd, max_connection_size) < 0)
     {
         perror("Listen failed");
         close_socket(server_fd);
-        return -1;
+        exit(EXIT_FAILURE);
     }
     return server_fd;
 }
@@ -107,7 +107,7 @@ int add_fd_to_epoll(int epoll_fd, int fd, uint32_t events)
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1)
     {
         perror("epoll_ctl");
-        return -1;
+        exit(EXIT_FAILURE);
     }
     return 0;
 }
