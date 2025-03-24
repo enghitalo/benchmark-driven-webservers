@@ -53,13 +53,13 @@
 _C_
 
 ```sh
-clear && gcc -o 4_spin_loop_example.out 9_adaptive_event_handling_example.c -lpthread && valgrind ./4_spin_loop_example.out
+clear && gcc -o 11_non_blocking_mode.out 11_non_blocking_mode.c -lpthread && valgrind ./11_non_blocking_mode.out
 ```
 
 # debug
 
 ```sh
-valgrind ./4_spin_loop_example
+valgrind ./11_non_blocking_mode
 ```
 
 **Test with `curl`**:
@@ -72,7 +72,7 @@ curl http://localhost:8080
 # generate Assembly from C code
 
 ```sh
-gcc -S 4_spin_loop_example.c
+gcc -S 11_non_blocking_mode.c
 ```
 
 # WRK
