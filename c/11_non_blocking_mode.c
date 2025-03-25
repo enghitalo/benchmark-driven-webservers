@@ -1,16 +1,16 @@
 /*
 curl --verbose  http://127.0.0.1:8081
 
-wrk -t16 -c512 -d60s http://127.0.0.1:8081
+wrk -H 'Connection: "keep-alive"' --connections 512 --threads 16 --duration 10s --timeout 1 http://localhost:8081/ 
 
-Running 1m test @ http://127.0.0.1:8081
+Running 10s test @ http://localhost:8081/
   16 threads and 512 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.06ms    1.31ms  25.53ms   85.13%
-    Req/Sec    33.37k     6.47k   60.49k    79.34%
-  31890362 requests in 1.00m, 1.54GB read
-Requests/sec: 530632.51
-Transfer/sec:     26.31MB
+    Latency     1.24ms    1.41ms  25.44ms   85.16%
+    Req/Sec    31.61k     5.03k   51.26k    72.81%
+  5059127 requests in 10.09s, 366.68MB read
+Requests/sec: 501562.70
+Transfer/sec:     36.35MB
 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +37,17 @@ typedef struct
     void *(*request_handler)(void *);
 } Server;
 
-void set_blocking(int fd, int blocking)
+struct arg_struct
+{
+    Server *server;
+    int epoll_fd;
+};
+
+/**
+ * Sets a file descriptor to non-blocking mode.
+ * @param fd The file descriptor to modify.
+ */
+void set_non_blocking(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1)
@@ -45,21 +55,26 @@ void set_blocking(int fd, int blocking)
         perror("fcntl F_GETFL failed");
         return;
     }
-    if (blocking)
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
     {
-        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-    }
-    else
-    {
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        perror("fcntl F_SETFL failed");
     }
 }
 
+/**
+ * Closes a socket file descriptor.
+ * @param fd The file descriptor to close.
+ */
 void close_socket(int fd)
 {
     close(fd);
 }
 
+/**
+ * Creates and configures a server socket.
+ * @param port The port number to bind to.
+ * @return The server socket file descriptor, or -1 on failure.
+ */
 int create_server_socket(int port)
 {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -68,6 +83,8 @@ int create_server_socket(int port)
         perror("Socket creation failed");
         exit(EXIT_FAILURE);
     }
+
+    set_non_blocking(server_fd); // Set server socket to non-blocking
 
     int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0)
@@ -99,6 +116,13 @@ int create_server_socket(int port)
     return server_fd;
 }
 
+/**
+ * Adds a file descriptor to an epoll instance.
+ * @param epoll_fd The epoll file descriptor.
+ * @param fd The file descriptor to add.
+ * @param events The events to monitor (e.g., EPOLLIN).
+ * @return 0 on success, -1 on failure.
+ */
 int add_fd_to_epoll(int epoll_fd, int fd, uint32_t events)
 {
     struct epoll_event ev = {
@@ -107,81 +131,143 @@ int add_fd_to_epoll(int epoll_fd, int fd, uint32_t events)
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1)
     {
         perror("epoll_ctl");
-        exit(EXIT_FAILURE);
+        return -1;
     }
     return 0;
 }
 
+/**
+ * Removes a file descriptor from an epoll instance.
+ * @param epoll_fd The epoll file descriptor.
+ * @param fd The file descriptor to remove.
+ */
 void remove_fd_from_epoll(int epoll_fd, int fd)
 {
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
 }
 
-void handle_accept_loop(Server *server)
+/**
+ * Handles accepting new client connections in the main thread.
+ * @param server Pointer to the Server struct.
+ * @param main_epoll_fd The epoll instance monitoring the server socket.
+ */
+void handle_accept_loop(Server *server, int main_epoll_fd)
 {
+    static int next_worker = 0;
+    struct epoll_event events[1];
+
     while (1)
     {
-        int client_fd = accept(server->socket_fd, NULL, NULL);
-        if (client_fd < 0)
+        int n = epoll_wait(main_epoll_fd, events, 1, -1);
+        if (n < 0)
         {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-            {
-                break;
-            }
-            perror("Accept failed");
-            return;
+            if (errno == EINTR)
+                continue;
+            perror("epoll_wait");
+            break;
         }
 
-        int epoll_fd = server->epoll_fds[client_fd % max_thread_pool_size];
-        if (add_fd_to_epoll(epoll_fd, client_fd, EPOLLIN | EPOLLET) == -1)
+        for (int i = 0; i < n; i++)
         {
-            close_socket(client_fd);
+            if (events[i].events & EPOLLIN)
+            {
+                while (1)
+                {
+                    int client_fd = accept(server->socket_fd, NULL, NULL);
+                    if (client_fd < 0)
+                    {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK)
+                            break;
+                        perror("accept");
+                        continue;
+                    }
+                    set_non_blocking(client_fd); // Set client socket to non-blocking
+                    int epoll_fd = server->epoll_fds[next_worker];
+                    next_worker = (next_worker + 1) % max_thread_pool_size;
+                    if (add_fd_to_epoll(epoll_fd, client_fd, EPOLLIN | EPOLLET) < 0)
+                    {
+                        close_socket(client_fd);
+                    }
+                }
+            }
         }
     }
 }
 
-// Define the arg_struct to hold the arguments for the thread function
-struct arg_struct
-{
-    Server *server;
-    int epoll_fd;
-};
-
+/**
+ * Worker thread function to process client events.
+ * @param arguments Pointer to the arg_struct containing server and epoll_fd.
+ * @return NULL (thread runs indefinitely).
+ */
 void *process_events(void *arguments)
 {
     struct arg_struct *args = (struct arg_struct *)arguments;
     Server *server = args->server;
     int epoll_fd = args->epoll_fd;
 
+    struct epoll_event events[max_connection_size];
     while (1)
     {
-        struct epoll_event events[max_connection_size];
         int num_events = epoll_wait(epoll_fd, events, max_connection_size, -1);
+        if (num_events < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            perror("epoll_wait");
+            break;
+        }
 
         for (int i = 0; i < num_events; i++)
         {
+            int fd = events[i].data.fd;
             if (events[i].events & (EPOLLHUP | EPOLLERR))
             {
-                remove_fd_from_epoll(epoll_fd, events[i].data.fd);
+                remove_fd_from_epoll(epoll_fd, fd);
+                close_socket(fd);
                 continue;
             }
 
             if (events[i].events & EPOLLIN)
             {
-                unsigned char request_buffer[140];
-                int bytes_read = recv(events[i].data.fd, request_buffer, 140 - 1, 0);
+                char request_buffer[1024];
+                int bytes_read = recv(fd, request_buffer, sizeof(request_buffer), 0);
+                if (bytes_read <= 0)
+                {
+                    // free(request_buffer);
+                    if (bytes_read == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+                    {
+                        remove_fd_from_epoll(epoll_fd, fd);
+                        close_socket(fd);
+                    }
+                    continue;
+                }
 
-                if (bytes_read > 0)
+                int is_keep_alive = (memmem(request_buffer, bytes_read, "Connection: \"keep-alive\"", 24) != NULL);
+
+                const char *response;
+                if (is_keep_alive)
                 {
-                    // Process request and get response
-                    // This would call server->request_handler in a real implementation
-                    char *response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
-                    send(events[i].data.fd, response, strlen(response), 0);
+                    response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!";
                 }
-                else if (bytes_read == 0 || (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+                else
                 {
-                    remove_fd_from_epoll(epoll_fd, events[i].data.fd);
+                    response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nHello, World!";
                 }
+
+                ssize_t sent = send(fd, response, strlen(response), MSG_NOSIGNAL);
+                if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                {
+                    remove_fd_from_epoll(epoll_fd, fd);
+                    close_socket(fd);
+                }
+
+                if (!is_keep_alive)
+                {
+                    // Error occurred
+                    remove_fd_from_epoll(epoll_fd, fd);
+                    close_socket(fd);
+                }
+                // If EAGAIN, wait for next EPOLLIN event
             }
         }
     }
@@ -189,6 +275,10 @@ void *process_events(void *arguments)
     return NULL;
 }
 
+/**
+ * Initializes and runs the server.
+ * @param server Pointer to the Server struct.
+ */
 void server_run(Server *server)
 {
     server->socket_fd = create_server_socket(server->port);
@@ -197,47 +287,79 @@ void server_run(Server *server)
         return;
     }
 
+    int main_epoll_fd = epoll_create1(0);
+    if (main_epoll_fd < 0)
+    {
+        perror("epoll_create1");
+        close_socket(server->socket_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (add_fd_to_epoll(main_epoll_fd, server->socket_fd, EPOLLIN) < 0)
+    {
+        close_socket(server->socket_fd);
+        close_socket(main_epoll_fd);
+        exit(EXIT_FAILURE);
+    }
+
     for (int i = 0; i < max_thread_pool_size; i++)
     {
         server->epoll_fds[i] = epoll_create1(0);
         if (server->epoll_fds[i] < 0)
         {
-            perror("epoll_create1 failed");
+            perror("epoll_create1");
+            for (int j = 0; j < i; j++)
+            {
+                close_socket(server->epoll_fds[j]);
+            }
+            close_socket(main_epoll_fd);
             close_socket(server->socket_fd);
-            exit(1);
+            exit(EXIT_FAILURE);
         }
 
-        if (add_fd_to_epoll(server->epoll_fds[i], server->socket_fd, EPOLLIN) == -1)
+        struct arg_struct *args = malloc(sizeof(struct arg_struct));
+        if (!args)
         {
+            perror("malloc");
+            for (int j = 0; j <= i; j++)
+            {
+                close_socket(server->epoll_fds[j]);
+            }
+            close_socket(main_epoll_fd);
             close_socket(server->socket_fd);
-            close_socket(server->epoll_fds[i]);
-            return;
+            exit(EXIT_FAILURE);
         }
+        args->server = server;
+        args->epoll_fd = server->epoll_fds[i];
 
-        struct arg_struct args;
-        args.server = server;
-        args.epoll_fd = server->epoll_fds[i];
-
-        if (pthread_create(&(server->threads[i]), NULL, &process_events, (void *)&args) != 0)
+        if (pthread_create(&(server->threads[i]), NULL, process_events, args) != 0)
         {
-            perror("Thread creation failed");
+            perror("pthread_create");
+            free(args);
+            for (int j = 0; j <= i; j++)
+            {
+                close_socket(server->epoll_fds[j]);
+            }
+            close_socket(main_epoll_fd);
             close_socket(server->socket_fd);
-            close_socket(server->epoll_fds[i]);
             exit(EXIT_FAILURE);
         }
     }
 
     printf("listening on http://localhost:%d/\n", server->port);
-    handle_accept_loop(server);
+    handle_accept_loop(server, main_epoll_fd);
 }
 
+/**
+ * Main entry point of the program.
+ * @return Exit status.
+ */
 int main()
 {
     Server server = {
         .port = 8081,
-        .socket_fd = -1, // Socket file descriptor initialized to -1 because it is not created yet
+        .socket_fd = -1,
         .request_handler = NULL};
-
     server_run(&server);
     return 0;
 }
