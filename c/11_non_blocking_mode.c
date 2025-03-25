@@ -1,7 +1,7 @@
 /*
 curl --verbose  http://127.0.0.1:8081
 
-wrk -H 'Connection: "keep-alive"' --connections 512 --threads 16 --duration 10s --timeout 1 http://localhost:8081/ 
+wrk -H 'Connection: "keep-alive"' --connections 512 --threads 16 --duration 10s --timeout 1 http://localhost:8081/
 
 Running 10s test @ http://localhost:8081/
   16 threads and 512 connections
