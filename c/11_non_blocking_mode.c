@@ -22,9 +22,10 @@ Transfer/sec:     36.35MB
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
+#include <asm-generic/socket.h>
 
 #define max_connection_size 1024
-#define max_thread_pool_size 8
+#define max_thread_pool_size 16
 
 const unsigned char tiny_bad_request_response[] = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -251,7 +252,6 @@ void *process_events(void *arguments)
                     remove_fd_from_epoll(epoll_fd, fd);
                     close_socket(fd);
                 }
-
             }
         }
     }
@@ -341,7 +341,7 @@ void server_run(Server *server)
 int main()
 {
     Server server = {
-        .port = 8081,
+        .port = 8080,
         .socket_fd = -1,
         .request_handler = NULL};
     server_run(&server);
