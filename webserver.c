@@ -5,7 +5,7 @@
 #include <signal.h>
 #include <unistd.h>
 
-// wrk -H 'Connection: "keep-alive"' --connections 512 --threads 8 --duration 20 --timeout 1 http://localhost:8080/
+// wrk -H 'Connection: "keep-alive"' --connections 512 --threads 16 --duration 20 --timeout 1 http://localhost:8080/
 #define PORT 8080
 #define SERVER "127.0.0.1"
 

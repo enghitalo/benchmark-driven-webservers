@@ -242,17 +242,8 @@ void *process_events(void *arguments)
                     continue;
                 }
 
-                int is_keep_alive = (memmem(request_buffer, bytes_read, "Connection: \"keep-alive\"", 24) != NULL);
-
                 const char *response;
-                if (is_keep_alive)
-                {
-                    response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!";
-                }
-                else
-                {
-                    response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nHello, World!";
-                }
+                response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!";
 
                 ssize_t sent = send(fd, response, strlen(response), MSG_NOSIGNAL);
                 if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
@@ -261,13 +252,6 @@ void *process_events(void *arguments)
                     close_socket(fd);
                 }
 
-                if (!is_keep_alive)
-                {
-                    // Error occurred
-                    remove_fd_from_epoll(epoll_fd, fd);
-                    close_socket(fd);
-                }
-                // If EAGAIN, wait for next EPOLLIN event
             }
         }
     }
